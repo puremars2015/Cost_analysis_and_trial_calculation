@@ -18,7 +18,7 @@ ORG_OPTIONS = {
 	"WPT": "樹谷廠",
 	"WPD": "同奈廠",
 }
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 300
 
 app = Flask(__name__)
 
@@ -54,8 +54,8 @@ class BomService:
 		self._bom_cache[cache_key] = bom_items
 		return bom_items
 
-	def resolve_raw_materials(self, org_code: str, item_no: str) -> list[str]:
-		raw_materials: list[str] = []
+	def resolve_raw_materials(self, org_code: str, item_no: str) -> list[tuple[str, str]]:
+		raw_materials: list[tuple[str, str]] = []
 		seen_materials: set[str] = set()
 		self._collect_raw_materials(org_code, item_no, [], raw_materials, seen_materials)
 		return raw_materials
@@ -65,7 +65,7 @@ class BomService:
 		org_code: str,
 		item_no: str,
 		stack: list[str],
-		raw_materials: list[str],
+		raw_materials: list[tuple[str, str]],
 		seen_materials: set[str],
 	) -> None:
 		if item_no in stack:
@@ -85,7 +85,8 @@ class BomService:
 				continue
 
 			if component_item.startswith("3") and component_item not in seen_materials:
-				raw_materials.append(component_item)
+				desc = str(component.get("COMPONENT_DESC") or "").strip()
+				raw_materials.append((component_item, desc))
 				seen_materials.add(component_item)
 
 	def _put_json(self, url: str, payload: dict[str, str]) -> dict[str, Any]:
@@ -110,6 +111,7 @@ def build_bom_report(org_code: str) -> AppResult:
 
 	for item in finished_items:
 		finished_item_no = str(item.get("segment1") or "").strip()
+		finished_item_desc = str(item.get("description") or "").strip()
 		if not finished_item_no:
 			continue
 
@@ -120,9 +122,10 @@ def build_bom_report(org_code: str) -> AppResult:
 			raw_materials = []
 
 		material_column_count = max(material_column_count, len(raw_materials))
-		row = {"成品料號": finished_item_no}
-		for index, raw_material in enumerate(raw_materials, start=1):
-			row[f"原料料號{index}"] = raw_material
+		row = {"成品料號": finished_item_no, "成品說明": finished_item_desc}
+		for index, (raw_item, raw_desc) in enumerate(raw_materials, start=1):
+			row[f"原料料號{index}"] = raw_item
+			row[f"原料說明{index}"] = raw_desc
 		rows.append(row)
 
 	normalized_rows = normalize_rows(rows, material_column_count)
@@ -138,16 +141,25 @@ def build_bom_report(org_code: str) -> AppResult:
 def normalize_rows(rows: list[dict[str, str]], material_column_count: int) -> list[dict[str, str]]:
 	normalized_rows: list[dict[str, str]] = []
 	for row in rows:
-		normalized_row = {"成品料號": row.get("成品料號", "")}
+		normalized_row = {
+			"成品料號": row.get("成品料號", ""),
+			"成品說明": row.get("成品說明", ""),
+		}
 		for index in range(1, material_column_count + 1):
-			column_name = f"原料料號{index}"
-			normalized_row[column_name] = row.get(column_name, "")
+			item_col = f"原料料號{index}"
+			desc_col = f"原料說明{index}"
+			normalized_row[item_col] = row.get(item_col, "")
+			normalized_row[desc_col] = row.get(desc_col, "")
 		normalized_rows.append(normalized_row)
 	return normalized_rows
 
 
 def get_report_columns(material_column_count: int) -> list[str]:
-	return ["成品料號", *[f"原料料號{index}" for index in range(1, material_column_count + 1)]]
+	cols = ["成品料號", "成品說明"]
+	for index in range(1, material_column_count + 1):
+		cols.append(f"原料料號{index}")
+		cols.append(f"原料說明{index}")
+	return cols
 
 
 PAGE_TEMPLATE = """
@@ -157,6 +169,19 @@ PAGE_TEMPLATE = """
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>成本分析與試算系統 v0.1</title>
+	<base href="/">
+	<script>
+		// 設置 base href 為當前路徑（例如 /marcom/ 或 /cost-analyze/）
+		(function() {
+			var path = window.location.pathname;
+			if (path.match(/^\/(marcom|cost-analyze)\//)) {
+				var baseTag = document.querySelector('base');
+				if (baseTag) {
+					baseTag.href = path.replace(/\/[^\/]*$/, '/');
+				}
+			}
+		})();
+	</script>
 	<style>
 		:root {
 			color-scheme: light;
@@ -359,7 +384,7 @@ PAGE_TEMPLATE = """
 			<h1>成本分析與試算系統 v0.1</h1>
 			<p>依照廠別抓取 93 開頭成品料號，遞迴展開 53 開頭半成品 BOM，直到取得 3 開頭原始原料，並產出成品與原料對照表。</p>
 
-			<form method="get" action="/" class="controls">
+			<form method="get" action="" class="controls">
 				<label>
 					廠別
 					<select name="org_code">
@@ -370,7 +395,7 @@ PAGE_TEMPLATE = """
 				</label>
 				<button type="submit">載入 BOM 對照表</button>
 				{% if report %}
-				<a class="button-link" href="/export?org_code={{ report.org_code }}">下載 Excel</a>
+				<a class="button-link" href="?org_code={{ report.org_code }}&export=1">下載 Excel</a>
 				{% endif %}
 			</form>
 		</section>
@@ -453,6 +478,18 @@ def index() -> str:
 	report = None
 	columns: list[str] = []
 
+	# Handle export request (via query param for relative path)
+	if request.args.get("export") == "1":
+		report = build_bom_report(selected_org_code)
+		excel_file = create_excel_file(report)
+		filename = f"bom_report_{selected_org_code}.xlsx"
+		return send_file(
+			excel_file,
+			as_attachment=True,
+			download_name=filename,
+			mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		)
+
 	if "org_code" in request.args:
 		report = build_bom_report(selected_org_code)
 		columns = get_report_columns(report.material_column_count)
@@ -463,23 +500,6 @@ def index() -> str:
 		selected_org_code=selected_org_code,
 		report=report,
 		columns=columns,
-	)
-
-
-@app.get("/export")
-def export_excel() -> Response:
-	selected_org_code = request.args.get("org_code", DEFAULT_ORG_CODE).upper()
-	if selected_org_code not in ORG_OPTIONS:
-		selected_org_code = DEFAULT_ORG_CODE
-
-	report = build_bom_report(selected_org_code)
-	excel_file = create_excel_file(report)
-	filename = f"bom_report_{selected_org_code}.xlsx"
-	return send_file(
-		excel_file,
-		as_attachment=True,
-		download_name=filename,
-		mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 	)
 
 

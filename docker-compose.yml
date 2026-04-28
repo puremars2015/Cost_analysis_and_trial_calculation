@@ -1,0 +1,21 @@
+services:
+  web:
+    build: .
+    container_name: bom-web
+    networks:
+      - internal
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: bom-nginx
+    depends_on:
+      - web
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - web-shared
+      - internal
+
+networks:
+  web-shared:
+    external: true
+  internal:
