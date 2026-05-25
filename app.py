@@ -14,10 +14,12 @@ ITEM_MASTER_URL = "http://10.200.16.14/ords/wpo_mts/WIP_WORKORDER/ITEM_MASTER"
 BOM_URL = "http://10.200.16.14/ords/wpo_mts/WIP_WORKORDER/BOM"
 DEFAULT_ORG_CODE = "WPN"
 ORG_OPTIONS = {
+	"ALL": "全部廠別",
 	"WPN": "楠梓廠",
 	"WPT": "樹谷廠",
 	"WPD": "同奈廠",
 }
+ALL_ORG_CODES = ["WPN", "WPT", "WPD"]
 REQUEST_TIMEOUT = 300
 
 app = Flask(__name__)
@@ -104,29 +106,31 @@ service = BomService()
 
 
 def build_bom_report(org_code: str) -> AppResult:
-	finished_items = service.get_finished_items(org_code)
+	org_codes = ALL_ORG_CODES if org_code == "ALL" else [org_code]
 	rows: list[dict[str, str]] = []
 	errors: list[str] = []
 	material_column_count = 0
 
-	for item in finished_items:
-		finished_item_no = str(item.get("segment1") or "").strip()
-		finished_item_desc = str(item.get("description") or "").strip()
-		if not finished_item_no:
-			continue
+	for current_org in org_codes:
+		finished_items = service.get_finished_items(current_org)
+		for item in finished_items:
+			finished_item_no = str(item.get("segment1") or "").strip()
+			finished_item_desc = str(item.get("description") or "").strip()
+			if not finished_item_no:
+				continue
 
-		try:
-			raw_materials = service.resolve_raw_materials(org_code, finished_item_no)
-		except Exception as exc:
-			errors.append(f"{finished_item_no}: {exc}")
-			raw_materials = []
+			try:
+				raw_materials = service.resolve_raw_materials(current_org, finished_item_no)
+			except Exception as exc:
+				errors.append(f"{finished_item_no} ({current_org}): {exc}")
+				raw_materials = []
 
-		material_column_count = max(material_column_count, len(raw_materials))
-		row = {"成品料號": finished_item_no, "成品說明": finished_item_desc}
-		for index, (raw_item, raw_desc) in enumerate(raw_materials, start=1):
-			row[f"原料料號{index}"] = raw_item
-			row[f"原料說明{index}"] = raw_desc
-		rows.append(row)
+			material_column_count = max(material_column_count, len(raw_materials))
+			row = {"成品料號": finished_item_no, "成品說明": finished_item_desc}
+			for index, (raw_item, raw_desc) in enumerate(raw_materials, start=1):
+				row[f"原料料號{index}"] = raw_item
+				row[f"原料說明{index}"] = raw_desc
+			rows.append(row)
 
 	normalized_rows = normalize_rows(rows, material_column_count)
 	return AppResult(
@@ -413,7 +417,7 @@ PAGE_TEMPLATE = """
 				</div>
 				<div class="stat">
 					目前廠別
-					<strong>{{ report.org_code }}</strong>
+					<strong>{{ org_options[report.org_code] }}</strong>
 				</div>
 			</div>
 
