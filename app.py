@@ -56,8 +56,8 @@ class BomService:
 		self._bom_cache[cache_key] = bom_items
 		return bom_items
 
-	def resolve_raw_materials(self, org_code: str, item_no: str) -> list[tuple[str, str]]:
-		raw_materials: list[tuple[str, str]] = []
+	def resolve_raw_materials(self, org_code: str, item_no: str) -> list[tuple[str, str, str]]:
+		raw_materials: list[tuple[str, str, str]] = []
 		seen_materials: set[str] = set()
 		self._collect_raw_materials(org_code, item_no, [], raw_materials, seen_materials)
 		return raw_materials
@@ -67,7 +67,7 @@ class BomService:
 		org_code: str,
 		item_no: str,
 		stack: list[str],
-		raw_materials: list[tuple[str, str]],
+		raw_materials: list[tuple[str, str, str]],
 		seen_materials: set[str],
 	) -> None:
 		if item_no in stack:
@@ -88,7 +88,8 @@ class BomService:
 
 			if component_item.startswith("3") and component_item not in seen_materials:
 				desc = str(component.get("COMPONENT_DESC") or "").strip()
-				raw_materials.append((component_item, desc))
+				qty = str(component.get("COMPONENT_QUANTITY") or "").strip()
+				raw_materials.append((component_item, desc, qty))
 				seen_materials.add(component_item)
 
 	def _put_json(self, url: str, payload: dict[str, str]) -> dict[str, Any]:
@@ -127,9 +128,10 @@ def build_bom_report(org_code: str) -> AppResult:
 
 			material_column_count = max(material_column_count, len(raw_materials))
 			row = {"成品料號": finished_item_no, "成品說明": finished_item_desc}
-			for index, (raw_item, raw_desc) in enumerate(raw_materials, start=1):
+			for index, (raw_item, raw_desc, raw_qty) in enumerate(raw_materials, start=1):
 				row[f"原料料號{index}"] = raw_item
 				row[f"原料說明{index}"] = raw_desc
+				row[f"用量{index}"] = raw_qty
 			rows.append(row)
 
 	normalized_rows = normalize_rows(rows, material_column_count)
@@ -152,8 +154,10 @@ def normalize_rows(rows: list[dict[str, str]], material_column_count: int) -> li
 		for index in range(1, material_column_count + 1):
 			item_col = f"原料料號{index}"
 			desc_col = f"原料說明{index}"
+			qty_col = f"用量{index}"
 			normalized_row[item_col] = row.get(item_col, "")
 			normalized_row[desc_col] = row.get(desc_col, "")
+			normalized_row[qty_col] = row.get(qty_col, "")
 		normalized_rows.append(normalized_row)
 	return normalized_rows
 
@@ -163,6 +167,7 @@ def get_report_columns(material_column_count: int) -> list[str]:
 	for index in range(1, material_column_count + 1):
 		cols.append(f"原料料號{index}")
 		cols.append(f"原料說明{index}")
+		cols.append(f"用量{index}")
 	return cols
 
 
