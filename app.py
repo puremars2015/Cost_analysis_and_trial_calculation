@@ -7,168 +7,104 @@ from typing import Any
 
 import pandas as pd
 import requests
-from flask import Flask, Response, render_template_string, request, send_file
+from flask import Flask, render_template_string, request, send_file
 
 
-ITEM_MASTER_URL = "http://10.200.16.14/ords/wpo_mts/WIP_WORKORDER/ITEM_MASTER"
-BOM_URL = "http://10.200.16.14/ords/wpo_mts/WIP_WORKORDER/BOM"
+BOM_ITEM_URL = "http://10.200.16.14/ords/wpo_mts/WCTX_ESTIMATE_API/BOM_ITEM"
 DEFAULT_ORG_CODE = "WPN"
 ORG_OPTIONS = {
-	"ALL": "全部廠別",
-	"WPN": "楠梓廠",
-	"WPT": "樹谷廠",
-	"WPD": "同奈廠",
+    "WPN": "楠梓廠",
+    "WPT": "樹谷廠",
+    "WPD": "同奈廠",
 }
-ALL_ORG_CODES = ["WPN", "WPT", "WPD"]
-REQUEST_TIMEOUT = 300
+REQUEST_TIMEOUT = 30
+REPORT_COLUMNS = ["成品料號", "半成品料號", "原料料號", "原料數", "基重", "資源比率"]
 
 app = Flask(__name__)
 
 
 @dataclass
 class AppResult:
-	org_code: str
-	rows: list[dict[str, str]]
-	material_column_count: int
-	total_finished_items: int
-	errors: list[str]
+    org_code: str
+    item_no: str
+    rows: list[dict[str, Any]]
+    total_count: int
+    error: str = ""
 
 
-class BomService:
-	def __init__(self) -> None:
-		self.session = requests.Session()
-		self._bom_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+def fetch_bom_items(org_code: str, item_no: str) -> AppResult:
+    stripped = item_no.strip()
+    params: dict[str, str] = {"org_code": org_code}
+    if stripped:
+        params["item_no"] = stripped
 
-	def get_finished_items(self, org_code: str) -> list[dict[str, Any]]:
-		payload = {"Org_code": org_code, "Item": "93"}
-		data = self._put_json(ITEM_MASTER_URL, payload)
-		items = data.get("wipItem", [])
-		return [item for item in items if str(item.get("segment1", "")).startswith("93")]
+    try:
+        response = requests.get(BOM_ITEM_URL, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except requests.exceptions.Timeout:
+        return AppResult(
+            org_code=org_code, item_no=stripped, rows=[], total_count=0,
+            error="API 請求逾時，請稍後再試。",
+        )
+    except requests.exceptions.RequestException:
+        return AppResult(
+            org_code=org_code, item_no=stripped, rows=[], total_count=0,
+            error="API 請求失敗，請確認網路連線或聯絡系統管理員。",
+        )
 
-	def get_bom(self, org_code: str, item_no: str) -> list[dict[str, Any]]:
-		cache_key = (org_code, item_no)
-		if cache_key in self._bom_cache:
-			return self._bom_cache[cache_key]
+    try:
+        body = response.json()
+    except ValueError:
+        return AppResult(
+            org_code=org_code, item_no=stripped, rows=[], total_count=0,
+            error="API 回傳非 JSON 格式，請聯絡系統管理員。",
+        )
 
-		payload = {"Org_code": org_code, "Item_no": item_no}
-		data = self._put_json(BOM_URL, payload)
-		bom_items = data.get("wipBOMItem", [])
-		self._bom_cache[cache_key] = bom_items
-		return bom_items
+    if not isinstance(body, dict):
+        return AppResult(
+            org_code=org_code, item_no=stripped, rows=[], total_count=0,
+            error="API 回傳格式異常，請聯絡系統管理員。",
+        )
 
-	def resolve_raw_materials(self, org_code: str, item_no: str) -> list[tuple[str, str, str]]:
-		raw_materials: list[tuple[str, str, str]] = []
-		seen_materials: set[str] = set()
-		self._collect_raw_materials(org_code, item_no, [], raw_materials, seen_materials)
-		return raw_materials
+    if body.get("status") != "S":
+        msg = body.get("message") or "未知錯誤"
+        return AppResult(
+            org_code=org_code, item_no=stripped, rows=[], total_count=0,
+            error=f"API 回傳錯誤：{msg}",
+        )
 
-	def _collect_raw_materials(
-		self,
-		org_code: str,
-		item_no: str,
-		stack: list[str],
-		raw_materials: list[tuple[str, str, str]],
-		seen_materials: set[str],
-	) -> None:
-		if item_no in stack:
-			cycle = " -> ".join([*stack, item_no])
-			raise ValueError(f"偵測到 BOM 循環: {cycle}")
+    data = body.get("data")
+    if not isinstance(data, list):
+        return AppResult(
+            org_code=org_code, item_no=stripped, rows=[], total_count=0,
+            error="API 回傳 data 欄位格式異常，請聯絡系統管理員。",
+        )
 
-		bom_items = self.get_bom(org_code, item_no)
-		next_stack = [*stack, item_no]
+    rows: list[dict[str, Any]] = []
+    for item in data:
+        item_3_list = item.get("item_3") or []
+        item_3_str = (
+            ", ".join(str(x) for x in item_3_list)
+            if isinstance(item_3_list, list)
+            else str(item_3_list)
+        )
+        count_val = item.get("item_3_count")
+        rate_val = item.get("resource_rate")
+        rows.append({
+            "成品料號": str(item.get("item_9") or ""),
+            "半成品料號": str(item.get("item_5") or ""),
+            "原料料號": item_3_str,
+            "原料數": "" if count_val is None else str(count_val),
+            "基重": str(item.get("base_weight") or ""),
+            "資源比率": "" if rate_val is None else str(rate_val),
+        })
 
-		for component in bom_items:
-			component_item = str(component.get("COMPONENT_ITEM") or "").strip()
-			if not component_item:
-				continue
-
-			if component_item.startswith("53"):
-				self._collect_raw_materials(org_code, component_item, next_stack, raw_materials, seen_materials)
-				continue
-
-			if component_item.startswith("3") and component_item not in seen_materials:
-				desc = str(component.get("COMPONENT_DESC") or "").strip()
-				qty = str(component.get("COMPONENT_QUANTITY") or "").strip()
-				raw_materials.append((component_item, desc, qty))
-				seen_materials.add(component_item)
-
-	def _put_json(self, url: str, payload: dict[str, str]) -> dict[str, Any]:
-		response = self.session.put(
-			url,
-			json=payload,
-			headers={"accept": "application/json", "Content-Type": "application/json"},
-			timeout=REQUEST_TIMEOUT,
-		)
-		response.raise_for_status()
-		return response.json()
-
-
-service = BomService()
-
-
-def build_bom_report(org_code: str) -> AppResult:
-	org_codes = ALL_ORG_CODES if org_code == "ALL" else [org_code]
-	rows: list[dict[str, str]] = []
-	errors: list[str] = []
-	material_column_count = 0
-
-	for current_org in org_codes:
-		finished_items = service.get_finished_items(current_org)
-		for item in finished_items:
-			finished_item_no = str(item.get("segment1") or "").strip()
-			finished_item_desc = str(item.get("description") or "").strip()
-			if not finished_item_no:
-				continue
-
-			try:
-				raw_materials = service.resolve_raw_materials(current_org, finished_item_no)
-			except Exception as exc:
-				errors.append(f"{finished_item_no} ({current_org}): {exc}")
-				raw_materials = []
-
-			material_column_count = max(material_column_count, len(raw_materials))
-			row = {"成品料號": finished_item_no, "成品說明": finished_item_desc}
-			for index, (raw_item, raw_desc, raw_qty) in enumerate(raw_materials, start=1):
-				row[f"原料料號{index}"] = raw_item
-				row[f"原料說明{index}"] = raw_desc
-				row[f"用量{index}"] = raw_qty
-			rows.append(row)
-
-	normalized_rows = normalize_rows(rows, material_column_count)
-	return AppResult(
-		org_code=org_code,
-		rows=normalized_rows,
-		material_column_count=material_column_count,
-		total_finished_items=len(normalized_rows),
-		errors=errors,
-	)
-
-
-def normalize_rows(rows: list[dict[str, str]], material_column_count: int) -> list[dict[str, str]]:
-	normalized_rows: list[dict[str, str]] = []
-	for row in rows:
-		normalized_row = {
-			"成品料號": row.get("成品料號", ""),
-			"成品說明": row.get("成品說明", ""),
-		}
-		for index in range(1, material_column_count + 1):
-			item_col = f"原料料號{index}"
-			desc_col = f"原料說明{index}"
-			qty_col = f"用量{index}"
-			normalized_row[item_col] = row.get(item_col, "")
-			normalized_row[desc_col] = row.get(desc_col, "")
-			normalized_row[qty_col] = row.get(qty_col, "")
-		normalized_rows.append(normalized_row)
-	return normalized_rows
-
-
-def get_report_columns(material_column_count: int) -> list[str]:
-	cols = ["成品料號", "成品說明"]
-	for index in range(1, material_column_count + 1):
-		cols.append(f"原料料號{index}")
-		cols.append(f"原料說明{index}")
-		cols.append(f"用量{index}")
-	return cols
+    return AppResult(
+        org_code=org_code,
+        item_no=stripped,
+        rows=rows,
+        total_count=len(rows),
+    )
 
 
 PAGE_TEMPLATE = """
@@ -180,7 +116,6 @@ PAGE_TEMPLATE = """
 	<title>成本分析與試算系統 v0.1</title>
 	<base href="/">
 	<script>
-		// 設置 base href 為當前路徑（例如 /marcom/ 或 /cost-analyze/）
 		(function() {
 			var path = window.location.pathname;
 			if (path.match(/^\/(marcom|cost-analyze)\//)) {
@@ -259,6 +194,7 @@ PAGE_TEMPLATE = """
 		}
 
 		select,
+		input[type="text"],
 		button,
 		.button-link {
 			min-height: 44px;
@@ -268,7 +204,8 @@ PAGE_TEMPLATE = """
 			font: inherit;
 		}
 
-		select {
+		select,
+		input[type="text"] {
 			min-width: 220px;
 			background: #fff;
 			color: var(--text);
@@ -341,23 +278,18 @@ PAGE_TEMPLATE = """
 			border-bottom: 1px solid rgba(214, 196, 174, 0.7);
 			text-align: left;
 			vertical-align: top;
-			white-space: nowrap;
 		}
 
 		th {
 			position: sticky;
 			top: 0;
 			background: #f7ead7;
+			white-space: nowrap;
 		}
 
 		.errors {
 			background: var(--danger-bg);
 			color: var(--danger-text);
-		}
-
-		.errors ul {
-			margin: 12px 0 0;
-			padding-left: 20px;
 		}
 
 		.muted {
@@ -380,6 +312,7 @@ PAGE_TEMPLATE = """
 			}
 
 			select,
+			input[type="text"],
 			button,
 			.button-link {
 				width: 100%;
@@ -391,7 +324,7 @@ PAGE_TEMPLATE = """
 	<main>
 		<section class="hero">
 			<h1>成本分析與試算系統 v0.1</h1>
-			<p>依照廠別抓取 93 開頭成品料號，遞迴展開 53 開頭半成品 BOM，直到取得 3 開頭原始原料，並產出成品與原料對照表。</p>
+			<p>依廠別查詢 BOM 成本報表。成品料號可留白以查詢全部，或輸入特定料號篩選。</p>
 
 			<form method="get" action="" class="controls">
 				<label>
@@ -402,40 +335,38 @@ PAGE_TEMPLATE = """
 						{% endfor %}
 					</select>
 				</label>
-				<button type="submit">載入 BOM 對照表</button>
-				{% if report %}
-				<a class="button-link" href="?org_code={{ report.org_code }}&export=1">下載 Excel</a>
+				<label>
+					成品料號（可留白）
+					<input type="text" name="item_no" value="{{ item_no }}" placeholder="例：93.00058.200">
+				</label>
+				<button type="submit">查詢 BOM 報表</button>
+				{% if report and not report.error %}
+				<a class="button-link" href="?org_code={{ report.org_code }}{% if report.item_no %}&amp;item_no={{ report.item_no|urlencode }}{% endif %}&amp;export=1">下載 Excel</a>
 				{% endif %}
 			</form>
 		</section>
 
 		{% if report %}
 		<section class="content">
+			{% if report.error %}
+			<div class="panel errors">
+				<p><strong>查詢錯誤：</strong>{{ report.error }}</p>
+			</div>
+			{% else %}
 			<div class="stats">
 				<div class="stat">
-					已處理成品數
-					<strong>{{ report.total_finished_items }}</strong>
+					查詢筆數
+					<strong>{{ report.total_count }}</strong>
 				</div>
 				<div class="stat">
-					原料欄位數
-					<strong>{{ report.material_column_count }}</strong>
-				</div>
-				<div class="stat">
-					目前廠別
+					廠別
 					<strong>{{ org_options[report.org_code] }}</strong>
 				</div>
+				<div class="stat">
+					成品料號篩選
+					<strong>{{ report.item_no if report.item_no else "（全部）" }}</strong>
+				</div>
 			</div>
-
-			{% if report.errors %}
-			<div class="panel errors">
-				<p><strong>以下成品料號處理失敗，已先略過：</strong></p>
-				<ul>
-					{% for error in report.errors %}
-					<li>{{ error }}</li>
-					{% endfor %}
-				</ul>
-			</div>
-			{% endif %}
 
 			<div class="panel table-wrap">
 				{% if report.rows %}
@@ -458,9 +389,10 @@ PAGE_TEMPLATE = """
 					</tbody>
 				</table>
 				{% else %}
-				<p class="muted">查無符合條件的成品與原料對照資料。</p>
+				<p class="muted">查無符合條件的 BOM 資料。</p>
 				{% endif %}
 			</div>
+			{% endif %}
 		</section>
 		{% endif %}
 	</main>
@@ -470,51 +402,50 @@ PAGE_TEMPLATE = """
 
 
 def create_excel_file(report: AppResult) -> BytesIO:
-	dataframe = pd.DataFrame(report.rows, columns=get_report_columns(report.material_column_count))
-	output = BytesIO()
-	with pd.ExcelWriter(output, engine="openpyxl") as writer:
-		dataframe.to_excel(writer, index=False, sheet_name="BOM對照表")
-	output.seek(0)
-	return output
+    dataframe = pd.DataFrame(report.rows, columns=REPORT_COLUMNS)
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        dataframe.to_excel(writer, index=False, sheet_name="BOM報表")
+    output.seek(0)
+    return output
 
 
 @app.get("/")
-def index() -> str:
-	selected_org_code = request.args.get("org_code", DEFAULT_ORG_CODE).upper()
-	if selected_org_code not in ORG_OPTIONS:
-		selected_org_code = DEFAULT_ORG_CODE
+def index():
+    selected_org_code = request.args.get("org_code", DEFAULT_ORG_CODE).upper()
+    if selected_org_code not in ORG_OPTIONS:
+        selected_org_code = DEFAULT_ORG_CODE
 
-	report = None
-	columns: list[str] = []
+    item_no = request.args.get("item_no", "")
+    report = None
 
-	# Handle export request (via query param for relative path)
-	if request.args.get("export") == "1":
-		report = build_bom_report(selected_org_code)
-		excel_file = create_excel_file(report)
-		filename = f"bom_report_{selected_org_code}.xlsx"
-		return send_file(
-			excel_file,
-			as_attachment=True,
-			download_name=filename,
-			mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		)
+    if "org_code" in request.args:
+        report = fetch_bom_items(selected_org_code, item_no)
 
-	if "org_code" in request.args:
-		report = build_bom_report(selected_org_code)
-		columns = get_report_columns(report.material_column_count)
+        if request.args.get("export") == "1" and not report.error:
+            excel_file = create_excel_file(report)
+            name_part = f"_{report.item_no}" if report.item_no else ""
+            filename = f"bom_report_{report.org_code}{name_part}.xlsx"
+            return send_file(
+                excel_file,
+                as_attachment=True,
+                download_name=filename,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
-	return render_template_string(
-		PAGE_TEMPLATE,
-		org_options=ORG_OPTIONS,
-		selected_org_code=selected_org_code,
-		report=report,
-		columns=columns,
-	)
+    return render_template_string(
+        PAGE_TEMPLATE,
+        org_options=ORG_OPTIONS,
+        selected_org_code=selected_org_code,
+        item_no=item_no,
+        report=report,
+        columns=REPORT_COLUMNS,
+    )
 
 
 if __name__ == "__main__":
-	app.run(
-		debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
-		host=os.getenv("FLASK_HOST", "0.0.0.0"),
-		port=int(os.getenv("PORT", "5000")),
-	)
+    app.run(
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
+        host=os.getenv("FLASK_HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "5000")),
+    )

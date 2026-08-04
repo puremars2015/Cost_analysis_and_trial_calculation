@@ -1,14 +1,6 @@
 # 成本分析與試算系統
 
-這是一個flask架構的網站，主要功能是從EBS跟Agile系統取得成品料號的BOM結構，並且將BOM結構中的原始料號進行成本分析與試算。
-
-## v0.1 範圍
-
-- 僅做 BOM 對照表預覽與 Excel 匯出
-- `Item` 固定帶 `93`
-- 遞迴展開 `53` 開頭半成品，直到取得 `3` 開頭原始原料
-- 暫不處理成本試算
-- 暫不處理替代料
+這是一個 Flask 架構的網站，依廠別查詢 BOM 成本報表，並提供 Excel 匯出功能。
 
 ## 執行方式
 
@@ -30,155 +22,70 @@ python app.py
 http://127.0.0.1:5000
 ```
 
-## Docker
+## 資料來源
 
-1. 建立 image
+唯一資料來源為以下 REST API（GET）：
 
-```bash
-docker build -t cost-analysis-app .
+```
+GET http://10.200.16.14/ords/wpo_mts/WCTX_ESTIMATE_API/BOM_ITEM
 ```
 
-2. 啟動 container
+### 查詢參數
 
-```bash
-docker run --rm -p 5000:5000 cost-analysis-app
+| 參數       | 必填 | 說明                                     |
+|-----------|------|------------------------------------------|
+| `org_code` | 必填 | 廠別代碼，可選值：`WPN`（楠梓廠）、`WPT`（樹谷廠）、`WPD`（同奈廠） |
+| `item_no`  | 選填 | 成品料號篩選。**留白時不送出此參數**，API 會回傳該廠所有料號 |
+
+範例（查詢全部）：
+
+```
+GET .../WCTX_ESTIMATE_API/BOM_ITEM?org_code=WPN
 ```
 
-3. 開啟瀏覽器
+範例（指定料號）：
 
-```text
-http://127.0.0.1:5000
+```
+GET .../WCTX_ESTIMATE_API/BOM_ITEM?org_code=WPN&item_no=93.00058.200
 ```
 
-## 透過共用 Nginx 代理
+### API 回傳格式
 
-如果此專案要跟 `MarcomSys` 一起由同一個 Nginx container 對外提供，建議由 `MarcomSys/docker-compose.yml` 當總控：
-
-- `http://<private-ip>:84` 進入 MarcomSys
-- `http://<private-ip>:85` 進入本系統
-
-此模式使用同 IP 不同 port 分流，不需要 DNS 或 hosts 設定。
-
-## API 規格
-
-1. 從api取得全部成品料號
-curl -X 'PUT' \
-  'http://10.200.16.14/ords/wpo_mts/WIP_WORKORDER/ITEM_MASTER' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{"Org_code":"WPN","Item":"93"}'
-
-Item固定帶93，Org_code可以選WPN=楠梓廠、WPT=樹谷廠、WPD=同奈廠
-
-回傳格式如下：
-
+```json
 {
-  "wipItem": [
+  "status": "S",
+  "data": [
     {
-      "organization_id": 84,
-      "inventory_item_id": 6691,
-      "segment1": "93.BM080.400",
-      "description": "NBR080-6 40cm*1500M",
-      "ORGANIZATION_CODE": "WPN",
-      "FROM_UOM_CODE": "kg",
-      "TO_UOM_CODE": "rol",
-      "CONVERSION_RATE": 48
-    },
-    {
-      "organization_id": 84,
-      "inventory_item_id": 44147,
-      "segment1": "93.BM540.300",
-      "description": "NBR540-6 30cm*3000M(A01)",
-      "ORGANIZATION_CODE": "WPN",
-      "FROM_UOM_CODE": "kg",
-      "TO_UOM_CODE": "rol",
-      "CONVERSION_RATE": 36
-    },
-    {
-      "organization_id": 84,
-      "inventory_item_id": 44148,
-      "segment1": "93.BM540.960",
-      "description": "NBR540-6 96cm*3500M(A01)",
-      "ORGANIZATION_CODE": "WPN",
-      "FROM_UOM_CODE": "kg",
-      "TO_UOM_CODE": "rol",
-      "CONVERSION_RATE": 134.4
+      "item_9": "93.00058.200",
+      "item_5": "53.00058.L00",
+      "item_3": ["3.XXXXX.XXX"],
+      "item_3_count": 2,
+      "base_weight": 1.5,
+      "resource_rate": 0.85
     }
   ]
 }
+```
 
+`status` 為 `"S"` 時代表成功；否則 `message` 欄位含錯誤說明。
 
+### 回傳表格欄位
 
-2. 從api取得成品料號的BOM結構
+| 欄位     | 來源欄位          | 說明                         |
+|---------|-------------------|------------------------------|
+| 成品料號 | `item_9`          | 93 開頭成品料號               |
+| 半成品料號 | `item_5`        | 53 開頭半成品料號             |
+| 原料料號 | `item_3`（陣列）  | 3 開頭原料料號，多筆以逗號分隔 |
+| 原料數   | `item_3_count`    | 原料種類數                    |
+| 基重     | `base_weight`     | 基重                          |
+| 資源比率 | `resource_rate`   | 資源佔比                      |
 
-curl -X 'PUT' \
-  'http://10.200.16.14/ords/wpo_mts/WIP_WORKORDER/BOM' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{"Org_code":"WPN","Item_no":"93.BM080.400"}'
+## 已停用功能（舊版）
 
-回傳格式如下：
+以下 API 與邏輯在舊版（v0.1 初版）中使用，現已**全部停止使用**：
 
-{
-  "wipBOMItem": [
-    {
-      "ASSEMBLY_ITEM_ID": 6691,
-      "ASSEMBLY_ITEM": "93.BM080.400",
-      "ASSEMBLY_DESC": "NBR080-6 40cm*1500M",
-      "COMPONENT_ITEM_ID": 5537,
-      "COMPONENT_ITEM": "53.BM080.L00",
-      "COMPONENT_DESC": "NBR080-6 410cm",
-      "COMPONENT_QUANTITY": 1,
-      "SUBSTITUTE_ITEM_ID": null,
-      "SUBSTITUTE_ITEM": null,
-      "SUBSTITUTE_DESC": null,
-      "SUBSTITUTE_QUANTITY": null
-    },
-    {
-      "ASSEMBLY_ITEM_ID": 6691,
-      "ASSEMBLY_ITEM": "93.BM080.400",
-      "ASSEMBLY_DESC": "NBR080-6 40cm*1500M",
-      "COMPONENT_ITEM_ID": 3138,
-      "COMPONENT_ITEM": "44.B08A0.001",
-      "COMPONENT_DESC": "編織袋110cm*110cm",
-      "COMPONENT_QUANTITY": 0.02083,
-      "SUBSTITUTE_ITEM_ID": null,
-      "SUBSTITUTE_ITEM": null,
-      "SUBSTITUTE_DESC": null,
-      "SUBSTITUTE_QUANTITY": null
-    },
-    {
-      "ASSEMBLY_ITEM_ID": 6691,
-      "ASSEMBLY_ITEM": "93.BM080.400",
-      "ASSEMBLY_DESC": "NBR080-6 40cm*1500M",
-      "COMPONENT_ITEM_ID": 2663,
-      "COMPONENT_ITEM": "44.A039A.400",
-      "COMPONENT_DESC": "3\"(77mm)*9mm*400mm一般紙管",
-      "COMPONENT_QUANTITY": 0.02083,
-      "SUBSTITUTE_ITEM_ID": null,
-      "SUBSTITUTE_ITEM": null,
-      "SUBSTITUTE_DESC": null,
-      "SUBSTITUTE_QUANTITY": null
-    }
-  ]
-}
+- `PUT WIP_WORKORDER/ITEM_MASTER` — 取得成品料號清單
+- `PUT WIP_WORKORDER/BOM` — 取得 BOM 結構
+- 遞迴展開 53 開頭半成品的邏輯（逐層呼叫 BOM API 直到取得 3 開頭原料）
 
-然後這邊,會需要挑出其中的COMPONENT_ITEM,去呼叫第三個api取得原始料的料號,只需要挑53開頭的去再查一次BOM的API,因為53開頭的是半成品,93開頭是成品,3開頭的才是原始原料
-
-3. 從api取得原始料號的料號
-
-curl -X 'PUT' \
-  'http://10.200.16.14/ords/wpo_mts/WIP_WORKORDER/BOM' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{"Org_code":"WPN","Item_no":"53.BM080.L00"}'
-
-回傳格式如同前一步驟,因為是同一個API,只是傳入的Item_no不同,回傳的BOM結構也會不同,這邊就不再重複貼一次了
-
-4. 製作成品跟原料的BOM對照表,結構是
-
-成品料號 | 原料料號1 | 原料料號2 | 原料料號3 | ...
----|---|---|---|---
-
-
-5. 做成網頁的table,給使用者預覽,並另外提供下載成Excel的功能
+現在由 `WCTX_ESTIMATE_API/BOM_ITEM` 單一 GET 端點一次回傳展開後的完整 BOM 對照資料，不再需要客戶端遞迴。
