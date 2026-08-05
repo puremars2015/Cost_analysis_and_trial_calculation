@@ -187,7 +187,7 @@ def fetch_bom_items(org_code: str, item_no: str) -> AppResult:
             "半成品料號": str(item.get("item_5") or ""),
             "原料數": "" if count_val is None else str(count_val),
             "基重": str(item.get("base_weight") or ""),
-            "資源比率": "" if rate_val is None else str(rate_val),
+            "resource rate": "" if rate_val is None else str(rate_val),
         }
         # 加入展開後的原料欄位
         row.update(item_3_fields)
@@ -544,7 +544,7 @@ def _current_user():
 
 def build_report_columns(max_item_3_count: int) -> list[str]:
     """根據最大原料數動態生成報表欄位"""
-    base_columns = ["成品料號", "半成品料號", "原料數", "基重", "資源比率"]
+    base_columns = ["成品料號", "半成品料號", "原料數", "基重", "resource rate"]
     item_3_columns = [f"原料{i+1}" for i in range(max_item_3_count)]
     return base_columns + item_3_columns
 
