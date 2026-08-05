@@ -37,7 +37,7 @@ if not _session_secret:
 app.secret_key = _session_secret
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-# SESSION_COOKIE_SECURE 根据请求协议动态设置（在 before_request 中）
+# SESSION_COOKIE_SECURE 保持 False，同時支援 HTTP 與 HTTPS
 
 app.register_blueprint(auth_bp)
 app.register_blueprint(admin_bp)
@@ -50,11 +50,6 @@ _BARE_DECIMAL_RE = re.compile(r'(?P<prefix>[:\[,]\s*)\.(?P<fraction>\d+)(?=[,\]}
 
 @app.before_request
 def _auth_gate():
-    # 動態設置 SESSION_COOKIE_SECURE：根據 X-Forwarded-Proto 判斷是否 HTTPS
-    # 这样 HTTP 和 HTTPS 都可以保持 session
-    proto = request.headers.get("X-Forwarded-Proto", "http")
-    app.config["SESSION_COOKIE_SECURE"] = (proto == "https")
-
     path = request.path
     # Allow static files and whitelisted paths
     if path.startswith("/static"):
