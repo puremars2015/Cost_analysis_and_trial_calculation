@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+import json
 import os
+import re
 from typing import Any
 
 import pandas as pd
 import requests
-from flask import Flask, render_template_string, request, send_file
+from flask import Flask, abort, g, redirect, render_template_string, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+import db
+from auth import auth_bp
+from admin_users import admin_bp
 
 
 BOM_ITEM_URL = "http://10.200.16.14/ords/wpo_mts/WCTX_ESTIMATE_API/BOM_ITEM"
@@ -18,9 +25,74 @@ ORG_OPTIONS = {
     "WPD": "同奈廠",
 }
 REQUEST_TIMEOUT = 30
-REPORT_COLUMNS = ["成品料號", "半成品料號", "原料料號", "原料數", "基重", "資源比率"]
+
+# Paths that never require authentication
+_AUTH_WHITELIST = {"/auth/login", "/auth/logout", "/health"}
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
+_session_secret = os.environ.get("BOM_SESSION_SECRET")
+if not _session_secret:
+    raise RuntimeError("BOM_SESSION_SECRET must be configured")
+app.secret_key = _session_secret
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = True
+
+app.register_blueprint(auth_bp)
+app.register_blueprint(admin_bp)
+app.teardown_appcontext(db.close_db)
+
+# Matches bare leading-decimal numbers at JSON value positions, e.g. :.91 or [.91
+# Only fires when the decimal is followed by , ] or } so string content is unlikely to match.
+_BARE_DECIMAL_RE = re.compile(r'(?P<prefix>[:\[,]\s*)\.(?P<fraction>\d+)(?=[,\]}])')
+
+
+@app.before_request
+def _auth_gate():
+    path = request.path
+    # Allow static files and whitelisted paths
+    if path.startswith("/static"):
+        return
+    for prefix in _AUTH_WHITELIST:
+        if path == prefix or path.startswith(prefix + "/"):
+            return
+
+    guid = session.get("user_guid")
+    if not guid:
+        if request.is_json:
+            from flask import jsonify
+            return jsonify({"error": "Unauthorized"}), 401
+        next_url = f"{request.script_root}{request.full_path.rstrip('?')}"
+        return redirect(url_for("auth.login", next=next_url))
+
+    # Re-check active status on every request. The injectable loader keeps
+    # authentication tests isolated from the SQL Server container.
+    user_loader = app.config.get("AUTH_USER_LOADER", db.get_user_by_guid)
+    user = user_loader(guid)
+    if not user or not user["IS_ACTIVE"]:
+        session.clear()
+        if request.is_json:
+            from flask import jsonify
+            return jsonify({"error": "Unauthorized"}), 401
+        return redirect(url_for("auth.login"))
+
+    # A first-login/reset user may only change password or log out.
+    if user.get("MUST_CHANGE_PASSWORD") and path != "/auth/change-password":
+        return redirect(url_for("auth.change_password"))
+
+
+def _parse_response_json(response: Any) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        pass
+    # Upstream API sometimes emits bare decimals like :.91 — normalize then retry parse.
+    try:
+        normalized = _BARE_DECIMAL_RE.sub(r'\g<prefix>0.\g<fraction>', response.text)
+        return json.loads(normalized)
+    except (ValueError, TypeError):
+        raise ValueError("cannot parse response as JSON")
 
 
 @dataclass
@@ -30,6 +102,7 @@ class AppResult:
     rows: list[dict[str, Any]]
     total_count: int
     error: str = ""
+    max_item_3_count: int = 0  # 最大原料數量，用於動態生成原料欄位
 
 
 def fetch_bom_items(org_code: str, item_no: str) -> AppResult:
@@ -53,12 +126,22 @@ def fetch_bom_items(org_code: str, item_no: str) -> AppResult:
         )
 
     try:
-        body = response.json()
+        body = _parse_response_json(response)
     except ValueError:
-        return AppResult(
-            org_code=org_code, item_no=stripped, rows=[], total_count=0,
-            error="API 回傳非 JSON 格式，請聯絡系統管理員。",
-        )
+        try:
+            response = requests.get(BOM_ITEM_URL, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            body = _parse_response_json(response)
+        except ValueError:
+            return AppResult(
+                org_code=org_code, item_no=stripped, rows=[], total_count=0,
+                error="上游 API 暫時回應異常，請稍後再試。",
+            )
+        except requests.exceptions.RequestException:
+            return AppResult(
+                org_code=org_code, item_no=stripped, rows=[], total_count=0,
+                error="API 請求失敗，請確認網路連線或聯絡系統管理員。",
+            )
 
     if not isinstance(body, dict):
         return AppResult(
@@ -81,29 +164,41 @@ def fetch_bom_items(org_code: str, item_no: str) -> AppResult:
         )
 
     rows: list[dict[str, Any]] = []
+    max_item_3_count = 0
+
     for item in data:
         item_3_list = item.get("item_3") or []
-        item_3_str = (
-            ", ".join(str(x) for x in item_3_list)
-            if isinstance(item_3_list, list)
-            else str(item_3_list)
-        )
+        if not isinstance(item_3_list, list):
+            item_3_list = [item_3_list] if item_3_list else []
+
+        # 更新最大原料數
+        current_count = len(item_3_list)
+        if current_count > max_item_3_count:
+            max_item_3_count = current_count
+
+        # 展開原料為多個欄位
+        item_3_fields = {f"原料{i+1}": str(x) for i, x in enumerate(item_3_list)}
+
         count_val = item.get("item_3_count")
         rate_val = item.get("resource_rate")
-        rows.append({
+
+        row = {
             "成品料號": str(item.get("item_9") or ""),
             "半成品料號": str(item.get("item_5") or ""),
-            "原料料號": item_3_str,
             "原料數": "" if count_val is None else str(count_val),
             "基重": str(item.get("base_weight") or ""),
             "資源比率": "" if rate_val is None else str(rate_val),
-        })
+        }
+        # 加入展開後的原料欄位
+        row.update(item_3_fields)
+        rows.append(row)
 
     return AppResult(
         org_code=org_code,
         item_no=stripped,
         rows=rows,
         total_count=len(rows),
+        max_item_3_count=max_item_3_count,
     )
 
 
@@ -176,6 +271,21 @@ PAGE_TEMPLATE = """
 		p {
 			margin: 0;
 			line-height: 1.6;
+		}
+
+		.user-bar {
+			display: flex;
+			justify-content: flex-end;
+			align-items: center;
+			gap: 12px;
+			margin-bottom: 12px;
+			font-size: 0.9rem;
+			color: var(--muted);
+		}
+
+		.user-bar a {
+			color: var(--accent);
+			text-decoration: none;
 		}
 
 		.controls {
@@ -322,6 +432,15 @@ PAGE_TEMPLATE = """
 </head>
 <body>
 	<main>
+		<div class="user-bar">
+			{% if current_user %}
+			{{ current_user.name }}（{{ current_user.role }}）
+			{% if current_user.role == 'ADMIN' %}
+			· <a href="{{ url_for('admin.users') }}">會員管理</a>
+			{% endif %}
+			· <a href="{{ url_for('auth.logout') }}">登出</a>
+			{% endif %}
+		</div>
 		<section class="hero">
 			<h1>成本分析與試算系統 v0.1</h1>
 			<p>依廠別查詢 BOM 成本報表。成品料號可留白以查詢全部，或輸入特定料號篩選。</p>
@@ -401,13 +520,39 @@ PAGE_TEMPLATE = """
 """
 
 
-def create_excel_file(report: AppResult) -> BytesIO:
-    dataframe = pd.DataFrame(report.rows, columns=REPORT_COLUMNS)
+def create_excel_file(report: AppResult, columns: list[str]) -> BytesIO:
+    dataframe = pd.DataFrame(report.rows, columns=columns)
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         dataframe.to_excel(writer, index=False, sheet_name="BOM報表")
     output.seek(0)
     return output
+
+
+def _current_user():
+    guid = session.get("user_guid")
+    if not guid:
+        return None
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        guid=guid,
+        account=session.get("account", ""),
+        name=session.get("name", ""),
+        role=session.get("role", ""),
+    )
+
+
+def build_report_columns(max_item_3_count: int) -> list[str]:
+    """根據最大原料數動態生成報表欄位"""
+    base_columns = ["成品料號", "半成品料號", "原料數", "基重", "資源比率"]
+    item_3_columns = [f"原料{i+1}" for i in range(max_item_3_count)]
+    return base_columns + item_3_columns
+
+
+@app.get("/health")
+def health():
+    from flask import jsonify
+    return jsonify({"ok": True})
 
 
 @app.get("/")
@@ -423,9 +568,11 @@ def index():
         report = fetch_bom_items(selected_org_code, item_no)
 
         if request.args.get("export") == "1" and not report.error:
-            excel_file = create_excel_file(report)
+            excel_columns = build_report_columns(report.max_item_3_count)
+            excel_file = create_excel_file(report, excel_columns)
             name_part = f"_{report.item_no}" if report.item_no else ""
             filename = f"bom_report_{report.org_code}{name_part}.xlsx"
+            from flask import send_file
             return send_file(
                 excel_file,
                 as_attachment=True,
@@ -433,13 +580,17 @@ def index():
                 mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
+    # 頁面渲染時的欄位
+    page_columns = build_report_columns(report.max_item_3_count) if report and report.rows else []
+
     return render_template_string(
         PAGE_TEMPLATE,
         org_options=ORG_OPTIONS,
         selected_org_code=selected_org_code,
         item_no=item_no,
         report=report,
-        columns=REPORT_COLUMNS,
+        columns=page_columns,
+        current_user=_current_user(),
     )
 
 
