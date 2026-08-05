@@ -438,6 +438,7 @@ PAGE_TEMPLATE = """
 			{% if current_user.role == 'ADMIN' %}
 			· <a href="{{ url_for('admin.users') }}">會員管理</a>
 			{% endif %}
+			· <a href="{{ url_for('auth.change_password') }}">修改密碼</a>
 			· <a href="{{ url_for('auth.logout') }}">登出</a>
 			{% endif %}
 		</div>
